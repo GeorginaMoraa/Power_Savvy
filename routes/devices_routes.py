@@ -5,6 +5,16 @@ import datetime
 
 devices_bp = Blueprint('device', __name__)
 
+@devices_bp.route('/devices', methods=['GET'])
+def get_devices():
+    try:
+        devices = list(mongo.db.devices.find())
+        for device in devices:
+            device["_id"] = str(device["_id"])  # Convert ObjectId to string
+        return jsonify({"devices": devices}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 @devices_bp.route('/device', methods=['POST'])
 def add_device():
     try:
@@ -19,7 +29,7 @@ def add_device():
         # Insert device into the database
         new_device = {
             "device_name": device_data["device_name"],
-            "power_rating": float(device_data["power_rating"]),
+            "power_rating": float(device_data["power_rating"]), #in watts
             "status": device_data["status"],
             "last_updated": datetime.datetime.now(datetime.timezone.utc)
         }
@@ -40,7 +50,7 @@ def update_device_status(device_id):
             {"_id": ObjectId(device_id)},
             {"$set": {
                 "status": device_data["status"],
-                "last_updated": datetime.timezone.utc()
+                "last_updated": datetime.datetime.now(datetime.timezone.utc)
             }}
         )
         
