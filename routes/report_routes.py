@@ -15,96 +15,115 @@ def get_report():
 
     return jsonify({"total_usage": total_usage, "unit": "kWh"}), 200
 
+@jwt_required()
+def calculate_realtime_usage(user_id):
+    """
+    Calculate real-time usage based on device logs for the authenticated user.
+    """
+    current_time = datetime.datetime.now(datetime.timezone.utc)  # Current time
+    total_usage = 0.0
 
-def calculate_current_usage():
-    """
-    Calculate the current usage of all ON devices based on their power rating and last_updated field.
-    """
-    # Fetch all devices that are ON
-    devices = mongo.db.devices.find({"status": "ON"})
-    
-    total_usage = 0.01
-    current_time = datetime.datetime.now(datetime.timezone.utc)  # Timezone-aware datetime
+    # Convert user_id to ObjectId
+    try:
+        user_id_obj = ObjectId(user_id)
+        print(f"[DEBUG] Successfully converted user_id to ObjectId: {user_id_obj}")
+    except Exception as e:
+        print(f"[DEBUG] Error converting user_id to ObjectId: {e}")
+        return 0.1  # Default usage if there's an error
+
+    print(f"[DEBUG] Querying devices with user_id: {user_id_obj}")
+    # Fetch all devices for the user
+    devices = list(mongo.db.devices.find({"user_id": user_id}))
+    print(f"[DEBUG] Devices fetched for User {user_id}: {devices}")
+
+    if not devices:
+        print(f"[DEBUG] No devices found for user {user_id_obj}. Returning default usage.")
+        return 0.1  # Default usage when no devices found
 
     for device in devices:
-        power_rating = device.get("power_rating")  # Power consumption in kWh
-        last_updated = device.get("last_updated")  # Last time the device was updated
+        device_id = device["_id"]
+        power_rating = device.get("power_rating", 0)  # Power consumption in kWh
+        print(f"[DEBUG] Device {device_id} Power Rating: {power_rating}")
 
-        if not power_rating or not last_updated:
-            # Skip devices without a valid power_rating or last_updated
+        if not power_rating or power_rating <= 0:
+            print(f"[DEBUG] Device {device_id} has invalid power rating. Using default 0.1 kWh.")
+            power_rating = 0.1  # Default power rating if invalid
+
+        # Fetch logs for this device, sorted by timestamp
+        logs = list(mongo.db.device_logs.find({"device_id": device_id}).sort("timestamp", 1))
+        print(f"[DEBUG] Logs for Device {device_id}: {logs}")
+
+        if not logs:
+            print(f"[DEBUG] No logs found for Device {device_id}. Skipping.")
             continue
 
-        # Ensure 'last_updated' is timezone-aware
-        if last_updated.tzinfo is None:
-            last_updated = last_updated.replace(tzinfo=datetime.timezone.utc)
+        # Track usage based on logs
+        previous_status = None
+        previous_timestamp = None
+        device_usage = 0.0
 
-        # Calculate elapsed time in hours
-        elapsed_time = (current_time - last_updated).total_seconds() / 3600  # Convert seconds to hours
+        for log in logs:
+            log_status = log.get("status", "").lower()
+            log_timestamp = log.get("timestamp")
 
-        # Calculate usage since the device was last updated
-        usage = power_rating * elapsed_time
-        total_usage += usage
+            if not log_timestamp:
+                print(f"[DEBUG] Log entry without timestamp: {log}. Skipping.")
+                continue
 
-        # Update the last_updated time for the device to current time
-        mongo.db.devices.update_one(
-            {"_id": device["_id"]},
-            {"$set": {"last_updated": current_time}}
-        )
+            # Ensure timezone-aware log timestamp
+            if log_timestamp.tzinfo is None:
+                log_timestamp = log_timestamp.replace(tzinfo=datetime.timezone.utc)
+
+            if previous_status == "on" and previous_timestamp:
+                duration = (log_timestamp - previous_timestamp).total_seconds() / 3600  # Convert seconds to hours
+                device_usage += duration * power_rating
+                print(f"[DEBUG] Device {device_id}: Duration {duration} hours, Usage Added {duration * power_rating} kWh")
+
+            previous_status = log_status
+            previous_timestamp = log_timestamp
+
+        # If device is still ON, calculate usage from last log to now
+        if previous_status == "on" and previous_timestamp:
+            duration = (current_time - previous_timestamp).total_seconds() / 3600
+            device_usage += duration * power_rating
+            print(f"[DEBUG] Device {device_id} is currently ON. Usage added: {duration * power_rating} kWh")
+
+        total_usage += device_usage
+
+    if total_usage == 0:
+        print(f"[DEBUG] Total usage is 0. Returning default usage.")
+        return 0.1  # Return minimum usage
 
     return round(total_usage, 2)
 
 
-
-def update_real_time_data():
-    """
-    Update the real-time data entry with the current usage value.
-    """
-    current_usage = calculate_current_usage()
-    mongo.db.consumption.update_one(
-        {"type": "realtime"},  # Identify the real-time data document
-        {
-            "$set": {
-                "current_usage": current_usage,
-                "timestamp": datetime.datetime.now(datetime.timezone.utc)  # Record the update time
-            }
-        },
-        upsert=True  # Create the document if it does not exist
-    )
-
-
-@report_bp.route('/update_realtime', methods=['POST'])
-def update_realtime_data_route():
-    """
-    API route to trigger real-time data update.
-    """
-    update_real_time_data()
-    return jsonify({"status": "success", "message": "Real-time data updated."}), 200
-
-
 @report_bp.route('/consumption/realtime', methods=['GET'])
-def get_realtime_data():
+@jwt_required()
+def get_realtime_data_with_logs():
     """
-    API route to fetch real-time consumption data.
+    API route to fetch real-time consumption data for the authenticated user using logs.
     """
-    data = mongo.db.consumption.find_one({"type": "realtime"})
-    if data:
+    user_id = get_jwt_identity()
+    try:
+        current_usage = calculate_realtime_usage(user_id)
         return jsonify({
             "status": "success",
             "data": {
-                "current_usage": data["current_usage"],
-                "timestamp": data["timestamp"]
+                "current_usage": current_usage,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc)
             }
-        })
-    return jsonify({"status": "error", "message": "No real-time data available"}), 404
+        }), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# Utility function to backfill 'created_at' for devices without it
-def backfill_created_at():
+
+@report_bp.route('/update_realtime', methods=['POST'])
+@jwt_required()
+def update_realtime_data_route():
     """
-    Utility function to ensure all devices have a 'created_at' field.
+    API route to trigger real-time data update for the authenticated user.
     """
-    default_time = datetime.datetime.now(datetime.timezone.utc)
-    mongo.db.devices.update_many(
-        {"created_at": {"$exists": False}},
-        {"$set": {"created_at": default_time}}
-    )
+    user_id = get_jwt_identity()
+    calculate_realtime_usage(user_id)
+    return jsonify({"status": "success", "message": "Real-time data updated."}), 200
