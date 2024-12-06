@@ -127,3 +127,78 @@ def update_realtime_data_route():
     user_id = get_jwt_identity()
     calculate_realtime_usage(user_id)
     return jsonify({"status": "success", "message": "Real-time data updated."}), 200
+
+
+@report_bp.route('/consumption/monthly', methods=['GET'])
+@jwt_required()
+def get_monthly_consumption_with_cost():
+    """
+    Fetch monthly energy consumption data along with cost breakdown for the authenticated user.
+    """
+    user_id = get_jwt_identity()
+
+    try:
+        # Ensure `user_id` is converted to ObjectId
+        user_id_obj = ObjectId(user_id)
+
+        # Constants for cost calculation
+        FUEL_ENERGY_COST_PER_KWH = 20.00  # KSH per kWh
+        FOREX_ADJUSTMENT = 1.5           # Flat forex adjustment fee
+        INFLATION_ADJUSTMENT = 2.0       # Inflation adjustment factor
+        ERC_LEVY = 0.5                   # Energy regulatory levy per kWh
+        VAT_RATE = 0.16                  # VAT percentage (16%)
+
+        # Aggregate monthly consumption data
+        pipeline = [
+            {"$match": {"user_id": user_id_obj}},  # Match documents for the user
+            {
+                "$group": {  # Group by year and month
+                    "_id": {
+                        "year": {"$year": {"$dateFromString": {"dateString": "$date"}}},
+                        "month": {"$month": {"$dateFromString": {"dateString": "$date"}}}
+                    },
+                    "total_usage": {"$sum": "$usage_kwh"}  # Sum usage for each group
+                }
+            },
+            {"$sort": {"_id.year": 1, "_id.month": 1}}  # Sort by year and month
+        ]
+
+        result = list(mongo.db.energy_usage.aggregate(pipeline))
+
+        # Calculate cost breakdown for each month
+        monthly_data = []
+        for entry in result:
+            year = entry["_id"]["year"]
+            month = entry["_id"]["month"]
+            total_usage = entry["total_usage"]
+
+            # Cost breakdown
+            fuel_energy_cost = FUEL_ENERGY_COST_PER_KWH * total_usage
+            forex_adj = FOREX_ADJUSTMENT * total_usage
+            inflation_adj = INFLATION_ADJUSTMENT * total_usage
+            erc_levy_total = ERC_LEVY * total_usage
+            total_before_vat = fuel_energy_cost + forex_adj + inflation_adj + erc_levy_total
+            vat = total_before_vat * VAT_RATE
+            total_amount = total_before_vat + vat
+
+            monthly_data.append({
+                "year": year,
+                "month": month,
+                "total_usage": round(total_usage, 2),
+                "total_cost": round(total_amount, 2),
+                "cost_breakdown": {
+                    "fuel_energy_cost": round(fuel_energy_cost, 2),
+                    "forex_adj": round(forex_adj, 2),
+                    "inflation_adj": round(inflation_adj, 2),
+                    "erc_levy": round(erc_levy_total, 2),
+                    "vat": round(vat, 2),
+                }
+            })
+
+        return jsonify({
+            "status": "success",
+            "data": monthly_data
+        }), 200
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500

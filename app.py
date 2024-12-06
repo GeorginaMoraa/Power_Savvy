@@ -8,7 +8,6 @@ from routes.energy_routes import energy_bp
 from routes.report_routes import report_bp
 from routes.devices_routes import device_bp
 from routes.rooms_route import room_bp
-from routes.notification_routes import notification
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -24,7 +23,6 @@ app.register_blueprint(energy_bp, url_prefix='/api/energy')
 app.register_blueprint(report_bp, url_prefix='/api/report')
 app.register_blueprint(device_bp, url_prefix='/api/device')
 app.register_blueprint(room_bp, url_prefix="/api/room")
-app.register_blueprint(notification, url_prefix="/api/notification")
 
 # WebSocket Events
 @socketio.on('connect')

@@ -141,28 +141,49 @@ def update_device_status():
         return jsonify({"error": "Status must be either 'on' or 'off'"}), 400
 
     try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        today = now.strftime('%Y-%m-%d')  # Get the current date in YYYY-MM-DD format
+
         # Update the device status
         result = mongo.db.devices.update_one(
             {"_id": ObjectId(device_id)},
-            {"$set": {"status": new_status, "status_changed_at": datetime.datetime.now(datetime.timezone.utc)}}
+            {"$set": {"status": new_status, "status_changed_at": now}}
         )
 
         if result.matched_count > 0:
-            # Log the status change
-            log_entry = {
+            # Fetch the last log for this device
+            last_log = mongo.db.device_logs.find_one(
+                {"device_id": ObjectId(device_id)},
+                sort=[("timestamp", -1)]
+            )
+
+            # Calculate the duration if the device was previously "on"
+            if last_log and last_log['status'] == "on":
+                last_timestamp = last_log["timestamp"]
+                if last_timestamp.tzinfo is None:
+                    last_timestamp = last_timestamp.replace(tzinfo=datetime.timezone.utc)
+
+                duration = (now - last_timestamp).total_seconds()
+
+                # Update the daily aggregation
+                mongo.db.device_status_daily.update_one(
+                    {"device_id": ObjectId(device_id), "date": today},
+                    {"$inc": {"on_duration": duration}, "$set": {"status": new_status}},
+                    upsert=True
+                )
+
+            # Insert the new log
+            mongo.db.device_logs.insert_one({
                 "device_id": ObjectId(device_id),
                 "status": new_status,
-                "timestamp": datetime.datetime.now(datetime.timezone.utc)
-            }
-            mongo.db.device_logs.insert_one(log_entry)
+                "timestamp": now
+            })
 
             return jsonify({"msg": "Device status updated successfully"}), 200
         else:
             return jsonify({"msg": "Device not found"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-    
 
 # Delete a device by ID
 @device_bp.route('/devices/<device_id>', methods=['DELETE'])
@@ -321,3 +342,158 @@ def get_device_on_duration_summary(device_id):
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@device_bp.route('/devices/daily-consumption', methods=['GET'])
+@jwt_required()
+def get_daily_consumption():
+    current_user = get_jwt_identity()  # Get the logged-in user's ID
+    date = request.args.get('date')  # Accept the date from the query string (e.g., 2024-12-05)
+
+    # Validate input
+    if not date:
+        return jsonify({"error": "Date is required"}), 400
+
+    try:
+        # Parse the provided date (ensure it's in YYYY-MM-DD format)
+        parsed_date = datetime.datetime.strptime(date, '%Y-%m-%d').date()
+
+        # Determine the start and end of the day for comparison (00:00:00 and 23:59:59)
+        start_of_day = datetime.datetime.combine(parsed_date, datetime.time.min)
+        end_of_day = datetime.datetime.combine(parsed_date, datetime.time.max)
+
+        # Fetch all devices for the logged-in user
+        devices = mongo.db.devices.find({"user_id": current_user})
+
+        consumption_data = []
+
+        for device in devices:
+            device_name = device['name']
+            room_id = device['room_id']
+            # Retrieve room name (ensure room_id exists and can be used to fetch room)
+            room = mongo.db.rooms.find_one({"_id": room_id})  # Assuming rooms collection exists
+
+            room_name = room['name'] if room else "Unknown Room"
+            
+            # Fetch the logs for the device, filtered by date
+            logs = mongo.db.device_logs.find({
+                "device_id": device['_id'],
+                "timestamp": {"$gte": start_of_day, "$lte": end_of_day}
+            })
+
+            total_consumption = 0.0
+
+            # Ensure that 'watts' is a float before performing calculations
+            watts = float(device.get('watts', 0))  # Default to 0 if 'watts' is missing or invalid
+
+            # Calculate the total energy consumption for the day
+            previous_timestamp = None
+            for log in logs:
+                if log['status'] == 'on' and previous_timestamp:
+                    duration = log['timestamp'] - previous_timestamp
+                    # Calculate the energy consumption in kWh
+                    # Watts to kWh conversion: consumption = (watts * duration in hours) / 1000
+                    duration_in_hours = duration.total_seconds() / 3600
+                    consumption = (watts * duration_in_hours) / 1000
+                    total_consumption += consumption
+
+                previous_timestamp = log['timestamp']
+
+            # Add the daily consumption data for the device
+            consumption_data.append({
+                "device_name": device_name,
+                "consumption": round(total_consumption, 2),  # rounded to 2 decimal places
+                "date": date,
+                "room": room_name
+            })
+
+        # Return the formatted data as a response (could also be passed to a frontend app)
+        return jsonify(consumption_data), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+
+@device_bp.route('/consumption/monthly', methods=['GET'])
+@jwt_required()
+def get_monthly_consumption_with_cost():
+    """
+    Fetch monthly energy consumption data along with cost breakdown for the authenticated user.
+    """
+    user_id = get_jwt_identity()  # Assuming this is the user ID passed from the JWT
+
+    try:
+        # Convert the user_id to ObjectId
+        user_id_obj = ObjectId(user_id)  # Convert string to ObjectId
+
+        # Constants for cost calculation
+        FUEL_ENERGY_COST_PER_KWH = 20.00  # KSH per kWh
+        FOREX_ADJUSTMENT = 1.5           # Flat forex adjustment fee
+        INFLATION_ADJUSTMENT = 2.0       # Inflation adjustment factor
+        ERC_LEVY = 0.5                   # Energy regulatory levy per kWh
+        VAT_RATE = 0.16                  # VAT percentage (16%)
+
+        # Get the month parameter from the request (YYYY-MM)
+        month_str = request.args.get('month')  # e.g., '2024-12'
+
+        # Parse the month into a date range (start of month and end of month)
+        start_of_month = datetime.strptime(month_str + "-01", "%Y-%m-%d")
+        end_of_month = (start_of_month.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+
+        # Aggregate monthly consumption data using the date range
+        pipeline = [
+            {"$match": {
+                "user_id": user_id_obj,
+                "date": {"$gte": start_of_month, "$lte": end_of_month}
+            }},
+            {
+                "$group": {  # Group by year and month
+                    "_id": {
+                        "year": {"$year": {"$dateFromString": {"dateString": "$date"}}},
+                        "month": {"$month": {"$dateFromString": {"dateString": "$date"}}}
+                    },
+                    "total_usage": {"$sum": "$usage_kwh"}  # Sum usage for each group
+                }
+            },
+            {"$sort": {"_id.year": 1, "_id.month": 1}}  # Sort by year and month
+        ]
+
+        result = list(mongo.db.energy_usage.aggregate(pipeline))
+
+        # Calculate cost breakdown for each month
+        monthly_data = []
+        for entry in result:
+            year = entry["_id"]["year"]
+            month = entry["_id"]["month"]
+            total_usage = entry["total_usage"]
+
+            # Cost breakdown
+            fuel_energy_cost = FUEL_ENERGY_COST_PER_KWH * total_usage
+            forex_adj = FOREX_ADJUSTMENT * total_usage
+            inflation_adj = INFLATION_ADJUSTMENT * total_usage
+            erc_levy_total = ERC_LEVY * total_usage
+            total_before_vat = fuel_energy_cost + forex_adj + inflation_adj + erc_levy_total
+            vat = total_before_vat * VAT_RATE
+            total_amount = total_before_vat + vat
+
+            monthly_data.append({
+                "year": year,
+                "month": month,
+                "total_usage": round(total_usage, 2),
+                "total_cost": round(total_amount, 2),
+                "cost_breakdown": {
+                    "fuel_energy_cost": round(fuel_energy_cost, 2),
+                    "forex_adj": round(forex_adj, 2),
+                    "inflation_adj": round(inflation_adj, 2),
+                    "erc_levy": round(erc_levy_total, 2),
+                    "vat": round(vat, 2),
+                }
+            })
+
+        return jsonify({
+            "status": "success",
+            "data": monthly_data
+        }), 200
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
